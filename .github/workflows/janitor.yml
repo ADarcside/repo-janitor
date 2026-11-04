@@ -1,0 +1,71 @@
+name: janitor
+
+on:
+  schedule:
+    - cron: "11 21 * * *"   # 02:41 IST every day
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (make changes, upload patches, push nothing)"
+        type: boolean
+        default: true
+      only:
+        description: "Only these repos (comma-separated names, blank = all)"
+        type: string
+        required: false
+
+permissions:
+  contents: write   # save state.json back to this repo
+  issues: write     # open a "needs you" issue here so you get notified
+
+concurrency:
+  group: janitor
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install tools
+        run: pip install -r requirements.txt
+
+      - name: Self-test the safety checks
+        run: python -m pytest -q tests
+
+      - name: Run janitor
+        env:
+          JANITOR_TOKEN: ${{ secrets.JANITOR_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          ONLY: ${{ inputs.only }}
+        run: python -m janitor
+
+      - name: Save state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: update janitor state [skip ci]"
+            git push
+          fi
+
+      - name: Upload dry-run patches
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: janitor-patches
+          path: out/
+          if-no-files-found: ignore

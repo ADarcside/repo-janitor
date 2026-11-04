@@ -1,0 +1,49 @@
+# repo-janitor settings. Edit and commit; the next run picks them up.
+
+owner: ADarcside
+
+# Repos to clean. Your own, non-fork repos. Add "owner/name" to include others.
+repos:
+  - NSIITB
+  - namma-space
+  - aR
+  - ULLAP
+  - ULLAP-
+  - MiniDbms-
+  - ames-housing-price-regression
+  - hehe
+  - forensic_cam
+  - Chefs_Court
+  - Meterological_webpage
+  - python-project
+  - multi
+  - AutoFI
+  - starbridge
+  - alpha-blog
+
+# Commits are authored as you. Leave blank to use your GitHub login and
+# private noreply email (taken from the token's account).
+author_name: ""
+author_email: ""
+
+timezone: Asia/Kolkata
+
+# A cleanup is "small" (auto-merged) only if it stays within both limits.
+# Anything bigger is opened as a PR labelled needs-review and left for you.
+small_max_lines: 150
+small_max_files: 10
+auto_merge_small: true
+
+python:
+  remove_unused_imports: true   # only `from x import y` names, never bare `import x`
+  formatter: auto                # auto | black | ruff | off  (auto follows the repo's pyproject)
+
+prettier:
+  enabled: true
+  # HTML, JSON and Markdown are left out on purpose (whitespace can matter there).
+  extensions: [.js, .jsx, .mjs, .cjs, .ts, .tsx, .css, .scss, .less]
+
+# Extra paths to never touch, on top of the built-in list
+# (node_modules/, dist/, build/, venv/, vendor/, migrations/, *.min.js, *.ipynb, ...).
+# Trailing "/" = folder name anywhere; otherwise a glob.
+exclude: []
