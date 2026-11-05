@@ -534,8 +534,9 @@ def main(argv: list[str] | None = None) -> int:
 
     token = os.environ.get("JANITOR_TOKEN")
     if not token:
-        print("JANITOR_TOKEN is not set (see README.md)", file=sys.stderr)
-        return 2
+        # Not set up yet: do nothing rather than fail every night.
+        print("::warning::JANITOR_TOKEN is not set, so nothing was done. See README.md → Setup.")
+        return 0
 
     me = json.loads(gh(["api", "user"], token).stdout)
     author = (cfg["author_name"] or me["login"],
