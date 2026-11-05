@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from . import safety
+from .checks import RepoTests
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = ROOT / "config.yml"
@@ -342,7 +343,7 @@ def pr_body(commits, notes, scope, lines, nfiles, small, auto_merge) -> str:
            f"**Scope:** {scope}", f"**Size:** {lines} changed lines in {nfiles} files", ""]
     out += [f"- {c}" for c in commits]
     if notes:
-        out += ["", "**Skipped on purpose:**"] + [f"- {n}" for n in notes[:30]]
+        out += ["", "**Checks and skipped items:**"] + [f"- {n}" for n in notes[:30]]
     out += ["", ("Small enough to merge automatically." if small and auto_merge
                  else "Too big to merge automatically, so it's waiting for your review.")]
     return "\n".join(out)
@@ -371,12 +372,23 @@ def process_repo(full: str, ctx: Ctx) -> Result:
     if last == head:
         return Result(full, "skipped", "no new commits")
 
-    if last and sh(["git", "cat-file", "-e", f"{last}^{{commit}}"], cwd=repo, check=False).returncode == 0:
+    known = bool(last) and sh(["git", "cat-file", "-e", f"{last}^{{commit}}"],
+                              cwd=repo, check=False).returncode == 0
+    if known:
         rels = git_list(repo, ["diff", "--name-only", "--diff-filter=AMR", last, head])
         scope = f"files changed since `{last[:7]}`"
+    elif ctx.dry_run:
+        # Nothing recorded yet: preview on the files touched by the last 10 commits.
+        count = int(sh(["git", "rev-list", "--count", "HEAD"], cwd=repo).stdout.strip())
+        base = f"HEAD~{min(10, count - 1)}" if count > 1 else None
+        rels = git_list(repo, ["diff", "--name-only", "--diff-filter=AMR", base, head]) if base \
+            else git_list(repo, ["ls-files"])
+        scope = "preview: files changed in the last 10 commits"
     else:
-        rels = git_list(repo, ["ls-files"])
-        scope = "whole repository (first run)"
+        # First time we see this repo (or its history was rewritten): start watching from
+        # here; only files changed after today get cleaned.
+        ctx.state[full] = head
+        return Result(full, "skipped", "started watching; files you change from now on will be cleaned")
     files = filter_files(repo, rels, cfg)
     if not files:
         if not ctx.dry_run:
@@ -391,6 +403,31 @@ def process_repo(full: str, ctx: Ctx) -> Result:
             ctx.state[full] = head
         return Result(full, "clean", "already tidy")
 
+    # Check the cleanup against the repo's own tests, if it has any.
+    force_review, test_note = False, "no tests found; relied on syntax-tree checks"
+    tests = RepoTests(repo, ctx.workdir / f"{repo.name}-env", git_list(repo, ["ls-files"]))
+    if tests.found:
+        print(f"  running {tests.describe()} before and after", flush=True)
+        sh(["git", "checkout", "-q", "-f", head], cwd=repo)
+        err = tests.install()
+        if err:
+            force_review, test_note = True, f"tests not run: {err}"
+        else:
+            before = tests.run()
+            if before.kind == "fail":
+                return Result(full, "blocked", f"tests were already failing, so nothing was cleaned: {before.detail}")
+            if before.kind == "unavailable":
+                force_review, test_note = True, f"tests not run: {before.detail}"
+            elif before.kind == "pass":
+                sh(["git", "checkout", "-q", "-f", branch], cwd=repo)
+                after = tests.run()
+                if after.kind != "pass":
+                    if not ctx.dry_run:
+                        ctx.state[full] = head  # don't retry the same change every night
+                    return Result(full, "failed", f"cleanup made tests fail, so nothing was pushed: {after.detail}")
+                test_note = f"{tests.describe()} passed before and after"
+        sh(["git", "checkout", "-q", "-f", branch], cwd=repo)
+
     numstat = git_list(repo, ["diff", "--numstat", f"{head}..{branch}"])
     lines = nfiles = 0
     for row in "\n".join(numstat).splitlines():
@@ -398,8 +435,9 @@ def process_repo(full: str, ctx: Ctx) -> Result:
         lines += int(a) if a.isdigit() else 0
         lines += int(d) if d.isdigit() else 0
         nfiles += 1
-    small = lines <= cfg["small_max_lines"] and nfiles <= cfg["small_max_files"]
-    size = f"{lines} lines / {nfiles} files"
+    small = lines <= cfg["small_max_lines"] and nfiles <= cfg["small_max_files"] and not force_review
+    size = f"{lines} lines / {nfiles} files; {test_note}"
+    notes = [f"Tests: {test_note}"] + notes
 
     if ctx.dry_run:
         OUT_DIR.mkdir(exist_ok=True)
@@ -432,9 +470,11 @@ def process_repo(full: str, ctx: Ctx) -> Result:
 
 # ---------------------------------------------------------------- reporting
 
-ICON = {"review": "🟡", "open": "🟠", "failed": "🔴", "merged": "🟢", "clean": "⚪",
-        "skipped": "⚪", "dry-run": "🔵"}
-ORDER = ["review", "open", "failed", "merged", "dry-run", "clean", "skipped"]
+ICON = {"review": "🟡", "open": "🟠", "blocked": "🔴", "failed": "🔴", "merged": "🟢",
+        "clean": "⚪", "skipped": "⚪", "dry-run": "🔵"}
+ORDER = ["review", "open", "blocked", "failed", "merged", "dry-run", "clean", "skipped"]
+NEEDS_YOU = ("review", "open", "blocked", "failed")
+REPORT_LABEL = "janitor-report"
 
 
 def render(results: list[Result], dry_run: bool, stamp: str) -> str:
@@ -447,14 +487,28 @@ def render(results: list[Result], dry_run: bool, stamp: str) -> str:
     return "\n".join(out)
 
 
-def notify(results: list[Result], md: str, stamp: str) -> None:
-    """Open an issue in the janitor repo (as github-actions) so you get a notification."""
-    need = [r for r in results if r.status in ("review", "open", "failed")]
+def notify(results: list[Result], md: str) -> None:
+    """Post tonight's summary as a comment on one 'Janitor nightly reports' issue.
+
+    It is posted as github-actions, so GitHub notifies you (and emails you if
+    email notifications are on) every night.
+    """
     repo, token = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN")
-    if not need or not repo or not token:
+    if not repo or not token:
         return
-    title = f"Janitor {stamp[:10]}: {len(need)} item(s) need you"
-    gh(["issue", "create", "-R", repo, "--title", title, "--body", md], token, check=False)
+    need = sum(r.status in NEEDS_YOU for r in results)
+    headline = f"### ⚠️ {need} item(s) need you" if need else "### ✅ Nothing needs you tonight"
+    body = f"{headline}\n\n{md}"
+    found = gh(["issue", "list", "-R", repo, "--label", REPORT_LABEL, "--state", "open",
+                "--json", "number", "--jq", ".[0].number // empty"], token, check=False).stdout.strip()
+    if not found:
+        gh(["label", "create", REPORT_LABEL, "-R", repo, "--color", "BFD4F2", "--force"], token, check=False)
+        url = gh(["issue", "create", "-R", repo, "--title", "Janitor nightly reports", "--label", REPORT_LABEL,
+                  "--body", "Each night's summary is posted here as a comment."],
+                 token, check=False).stdout.strip()
+        found = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+    if found:
+        gh(["issue", "comment", found, "-R", repo, "--body", body], token, check=False)
 
 
 # ---------------------------------------------------------------- entry point
@@ -513,5 +567,5 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(md + "\n")
     if not args.dry_run:
         STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-        notify(ctx.results, md, stamp)
+        notify(ctx.results, md)
     return 0

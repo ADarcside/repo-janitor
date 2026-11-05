@@ -21,10 +21,10 @@ repos:
   - starbridge
   - alpha-blog
 
-# Commits are authored as you. Leave blank to use your GitHub login and
-# private noreply email (taken from the token's account).
+# Commits are authored as you. A blank name uses your GitHub login; a blank
+# email uses your private GitHub noreply address.
 author_name: ""
-author_email: ""
+author_email: "aditya.gupta2911a.d@gmail.com"
 
 timezone: Asia/Kolkata
 
